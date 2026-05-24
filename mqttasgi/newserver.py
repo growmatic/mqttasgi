@@ -1,4 +1,5 @@
 from .server import Server as _BaseServer
+import asyncio
 import paho.mqtt.client as mqtt
 from paho.mqtt.properties import Properties
 from paho.mqtt.packettypes import PacketTypes
@@ -71,6 +72,12 @@ class Server(_BaseServer):
         if properties is None:
             properties = {}
 
+        self.log.info(
+            "[mqttasgi][receive] sub=%r topic=%s payload_len=%d known_subs=%s",
+            subscription, topic, len(payload) if payload else 0,
+            list(self.topics_subscription.keys()),
+        )
+
         if subscription == -1:
             self.log.warning(
                 "[mqttasgi][mqtt][receive] - Received message that no app is subscribed"
@@ -127,6 +134,10 @@ class Server(_BaseServer):
             self.client.subscribe(raw_topic, qos)
             status['qos'] = qos
         elif len(status['apps']) == 0:
+            self.log.info(
+                "[mqttasgi][subscribe] registering callback+subscribe raw=%s stripped=%s qos=%s",
+                raw_topic, topic, qos,
+            )
             # callback com properties
             self.client.message_callback_add(
                 topic,
@@ -140,6 +151,7 @@ class Server(_BaseServer):
             )
             self.client.subscribe(raw_topic, qos)
             status['qos'] = qos
+            self.log.info("[mqttasgi][subscribe] done raw=%s stripped=%s", raw_topic, topic)
         else:
             self.log.debug(
                 "[mqttasgi][app][subscribe] - Subscription to {}:{} has {} listeners"
@@ -238,11 +250,17 @@ class Server(_BaseServer):
         self.client.publish(**kwargs)
 
     def _handle_reconnect(self, on_connect=False):
-        """Override para respeitar transport unix e MQTTv5 no reconnect."""
+        """Override para respeitar transport unix e MQTTv5 no reconnect.
+
+        Limita a 10 tentativas (máx ~5 min de espera) antes de sair com código 1,
+        permitindo que o Docker reinicie o container via restart: on-failure.
+        """
         import time
+        import sys
+        _max = self.connect_max_retries if self.connect_max_retries > 0 else 10
         tries = 0
-        while tries < self.connect_max_retries or self.connect_max_retries == 0:
-            self.log.info("[mqttasgi][connection][reconnect] - Attempting {} reconnect".format(tries))
+        while tries < _max:
+            self.log.warning("[mqttasgi][reconnect] tentativa %d/%d", tries + 1, _max)
             try:
                 if on_connect is False:
                     self.client.reconnect()
@@ -253,20 +271,25 @@ class Server(_BaseServer):
                 else:
                     self.client.connect(self.host, self.port)
                 self.log.warning(
-                    "[mqttasgi][connection][reconnect] - Reconnected after {} attempts".format(tries)
+                    "[mqttasgi][reconnect] reconectado após %d tentativas", tries
                 )
-                break
+                return
             except KeyboardInterrupt as e:
                 raise e
             except Exception:
-                self.log.debug("[mqttasgi][connection][reconnect] - Exception during reconnect", exc_info=True)
-                time.sleep(min(tries, 30))
+                self.log.debug("[mqttasgi][reconnect] falha na tentativa %d", tries, exc_info=True)
+                time.sleep(min(tries * 3, 30))
             tries += 1
-        else:
-            self._handle_reconnect_failure()
+        self.log.error("[mqttasgi][reconnect] esgotadas %d tentativas — saindo (exit 1)", _max)
+        sys.exit(1)
 
     async def mqtt_receive_loop(self):
-        """Override para respeitar transport unix e MQTTv5 no connect inicial."""
+        """Override para respeitar transport unix e MQTTv5 no connect inicial.
+
+        Usa asyncio socket callbacks em vez de polling (loop + sleep a 50Hz).
+        O event loop acorda apenas quando há dados no socket MQTT — CPU idle ≈ 0.
+        loop_misc() a cada 1s cuida de keepalives e ping timeouts.
+        """
         if self.username:
             self.client.username_pw_set(self.username, self.password)
 
@@ -274,6 +297,29 @@ class Server(_BaseServer):
             self.client.tls_set(ca_certs=self.ca_cert, certfile=self.cert, keyfile=self.key)
         elif self.use_ssl:
             self.client.tls_set()
+
+        loop = asyncio.get_event_loop()
+
+        def _on_socket_open(client, userdata, sock):
+            self.log.info("[mqttasgi][socket] open fd=%s — reader registered", sock.fileno())
+            loop.add_reader(sock, client.loop_read)
+
+        def _on_socket_close(client, userdata, sock):
+            self.log.info("[mqttasgi][socket] close fd=%s — reader removed", sock.fileno())
+            loop.remove_reader(sock)
+
+        def _on_socket_register_write(client, userdata, sock):
+            self.log.info("[mqttasgi][socket] register_write fd=%s — writer registered", sock.fileno())
+            loop.add_writer(sock, client.loop_write)
+
+        def _on_socket_unregister_write(client, userdata, sock):
+            self.log.info("[mqttasgi][socket] unregister_write fd=%s — writer removed", sock.fileno())
+            loop.remove_writer(sock)
+
+        self.client.on_socket_open             = _on_socket_open
+        self.client.on_socket_close            = _on_socket_close
+        self.client.on_socket_register_write   = _on_socket_register_write
+        self.client.on_socket_unregister_write = _on_socket_unregister_write
 
         try:
             if self.transport == 'unix':
@@ -289,10 +335,17 @@ class Server(_BaseServer):
             except Exception:
                 await self.shutdown('CONNECTION_ERROR')
 
-        self.log.info("MQTT loop start")
+        self.log.info("[mqttasgi][loop] MQTT loop start — connected to %s:%s", self.host, self.port)
+        _heartbeat = 0
         try:
             while not self.stop:
-                self.client.loop(timeout=0.01)
-                await sleep(0.01)
+                self.client.loop_misc()
+                _heartbeat += 1
+                if _heartbeat % 30 == 0:
+                    self.log.info(
+                        "[mqttasgi][loop] heartbeat tick=%d subs=%s",
+                        _heartbeat, list(self.topics_subscription.keys()),
+                    )
+                await sleep(1)
         except Exception:
             await self.shutdown('Exception in receive loop')
