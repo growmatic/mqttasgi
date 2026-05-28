@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import paho.mqtt.client as mqtt
 from .server import Server
 from .utils import get_application
 from dotenv import load_dotenv
@@ -50,8 +51,12 @@ def main():
     parser.add_argument("application",
                         help=("The ASGI application instance to use as "
                               "path.to.module:application"))
+    parser.add_argument("-prot", "--protocol", choices=["311", "5"],
+                        help="MQTT protocol version (311 = MQTT v3.1.1, 5 = MQTT v5.0)",
+                        default=os.environ.get("MQTT_PROTOCOL", "311"))
 
     args = parser.parse_args()
+    protocol = mqtt.MQTTv5 if args.protocol == "5" else mqtt.MQTTv311
 
     logging.basicConfig(
         level={
@@ -77,7 +82,8 @@ def main():
         ca_cert=args.cacert,
         connect_max_retries=args.retries,
         use_ssl=args.use_ssl,
-        transport = args.transport
+        transport = args.transport,
+        protocol=protocol,
     )
 
     server.run()

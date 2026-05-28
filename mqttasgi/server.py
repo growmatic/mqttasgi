@@ -18,7 +18,7 @@ class Server(object):
     def __init__(self, application, host, port, username=None, password=None,
                  client_id=2407, mqtt_type_pub=None, mqtt_type_usub=None, mqtt_type_sub=None,
                  mqtt_type_msg=None, connect_max_retries=3, logger=None, clean_session=True, cert=None, key=None, ca_cert=None,
-                 use_ssl=False, transport ="tcp"):
+                 use_ssl=False, transport ="tcp", protocol=mqtt.MQTTv311):
 
         self.application_type = application
         self.application_data = {}
@@ -37,11 +37,16 @@ class Server(object):
         # paho-mqtt requires client_id to be a string; coerce any legacy integer values
         self.client_id = str(client_id) if client_id is not None else ""
         self.transport = transport
+        self.protocol = protocol
+        # MQTTv5 forbids clean_session in __init__ and uses clean_start on connect() instead.
+        # We carry the user's choice through both APIs to preserve semantics.
+        self._clean_start = clean_session
         client_kwargs = dict(
             client_id=self.client_id,
             transport=self.transport,
             userdata={"server": self, "host": self.host, "port": self.port},
-            clean_session=clean_session,
+            clean_session=None if protocol == mqtt.MQTTv5 else clean_session,
+            protocol=protocol,
         )
         if _PAHO_MQTT_V2:
             self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, **client_kwargs)
@@ -101,6 +106,8 @@ class Server(object):
             try:
                 if on_connect is False:
                     self.client.reconnect()
+                elif self.protocol == mqtt.MQTTv5:
+                    self.client.connect(self.host, self.port, clean_start=self._clean_start)
                 else:
                     self.client.connect(self.host, self.port)
                 self.log.warning("[mqttasgi][connection][reconnect] - Reconnected after {} attempts".format(tries))
@@ -167,7 +174,10 @@ class Server(object):
         elif self.use_ssl:
             self.client.tls_set()
         try:
-            self.client.connect(self.host, self.port)
+            if self.protocol == mqtt.MQTTv5:
+                self.client.connect(self.host, self.port, clean_start=self._clean_start)
+            else:
+                self.client.connect(self.host, self.port)
         except Exception as e:
             self.log.error("[mqttasgi][connect] - Initial connection to %s:%s failed: %s",
                            self.host, self.port, e, exc_info=True)
