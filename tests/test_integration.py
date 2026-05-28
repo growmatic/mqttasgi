@@ -19,6 +19,8 @@ import threading
 import time
 import pytest
 import paho.mqtt.client as mqtt
+from paho.mqtt.properties import Properties
+from paho.mqtt.packettypes import PacketTypes
 
 from mqttasgi.server import Server, _PAHO_MQTT_V2
 from mqttasgi.consumers import MqttConsumer
@@ -86,10 +88,17 @@ def mqtt_broker():
 # ---------------------------------------------------------------------------
 
 def _make_paho_client():
-    """Create a paho client compatible with whichever version is installed."""
+    """Create a paho v3.1.1 client compatible with whichever paho version is installed."""
     if _PAHO_MQTT_V2:
         return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     return mqtt.Client()
+
+
+def _make_paho_v5_client():
+    """Create a paho MQTTv5 client."""
+    if _PAHO_MQTT_V2:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+    return mqtt.Client(protocol=mqtt.MQTTv5)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +153,22 @@ class TestBrokerConnectivity:
         assert received == [b'hello']
 
 
+@pytest.fixture(scope='module')
+def live_broker():
+    """Reuse an already-running broker on BROKER_PORT (e.g. Docker mosquitto).
+
+    Unlike mqtt_broker, this fixture does NOT start a new process — it simply
+    checks if a broker is already accepting connections on BROKER_PORT.
+    Tests that use this fixture run against the Docker mosquitto and produce
+    real broker-side traffic (visible in docker logs).
+
+    Skipped when no broker is reachable on that port.
+    """
+    if not _broker_reachable(BROKER_PORT, timeout=1.0):
+        pytest.skip(f'No MQTT broker reachable on localhost:{BROKER_PORT}')
+    yield BROKER_PORT
+
+
 # ---------------------------------------------------------------------------
 # Server + consumer integration
 # ---------------------------------------------------------------------------
@@ -186,7 +211,7 @@ class TestServerConsumerIntegration:
             async def disconnect(self):
                 pass
 
-        server = Server(ListenerConsumer.as_asgi(), host='localhost', port=mqtt_broker)
+        server = Server(ListenerConsumer.as_asgi(), host='localhost', port=mqtt_broker, client_id=None)
 
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
@@ -215,3 +240,214 @@ class TestServerConsumerIntegration:
         assert received, "Consumer never received the published message"
         assert received[0]['topic'] == 'srv/test'
         assert received[0]['payload'] == b'from-outside'
+
+
+# ---------------------------------------------------------------------------
+# Shared subscriptions — requires live Docker broker
+# ---------------------------------------------------------------------------
+
+class TestSharedSubIntegration:
+    """End-to-end: consumer subscribes via $share/<group>/<topic>.
+
+    mosquitto 2.x supports shared subscriptions for both MQTTv3.1.1 and MQTTv5.
+    These tests verify the full path: broker receives the subscribe, distributes
+    a publish to one of the shared subscribers, and the consumer gets the message.
+    """
+
+    async def test_shared_sub_receives_message(self, live_broker):
+        """Consumer subscribed via $share/... receives messages published to the real topic."""
+        received = []
+        ready = threading.Event()
+
+        class SharedSubConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('$share/loadbalance/integ/shared', qos=1)
+                ready.set()
+
+            async def receive(self, mqtt_message):
+                received.append(mqtt_message)
+
+            async def disconnect(self):
+                pass
+
+        server = Server(SharedSubConsumer.as_asgi(), host='localhost', port=live_broker, client_id=None)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        loop = asyncio.get_event_loop()
+        connected = await loop.run_in_executor(None, lambda: ready.wait(timeout=5))
+        if not connected:
+            pytest.fail("Consumer did not connect and subscribe within 5 seconds")
+
+        pub_client = _make_paho_client()
+        pub_client.connect('localhost', live_broker)
+        pub_client.loop_start()
+        pub_client.publish('integ/shared', b'shared-payload', qos=1)
+        time.sleep(0.5)
+        pub_client.loop_stop()
+        pub_client.disconnect()
+
+        deadline = time.time() + 3
+        while not received and time.time() < deadline:
+            await asyncio.sleep(0.05)
+
+        assert received, "Shared subscription consumer never received the message"
+        assert received[0]['topic'] == 'integ/shared'
+        assert received[0]['payload'] == b'shared-payload'
+
+    async def test_shared_sub_wildcard_receives_message(self, live_broker):
+        """Consumer subscribed via $share/grp/sensors/# receives messages on sensors/…."""
+        received = []
+        ready = threading.Event()
+
+        class WildcardSharedConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('$share/grp/integ/sensors/#', qos=1)
+                ready.set()
+
+            async def receive(self, mqtt_message):
+                received.append(mqtt_message)
+
+            async def disconnect(self):
+                pass
+
+        server = Server(WildcardSharedConsumer.as_asgi(), host='localhost', port=live_broker, client_id=None)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        loop = asyncio.get_event_loop()
+        connected = await loop.run_in_executor(None, lambda: ready.wait(timeout=5))
+        if not connected:
+            pytest.fail("Consumer did not connect and subscribe within 5 seconds")
+
+        pub_client = _make_paho_client()
+        pub_client.connect('localhost', live_broker)
+        pub_client.loop_start()
+        pub_client.publish('integ/sensors/temp', b'42C', qos=1)
+        time.sleep(0.5)
+        pub_client.loop_stop()
+        pub_client.disconnect()
+
+        deadline = time.time() + 3
+        while not received and time.time() < deadline:
+            await asyncio.sleep(0.05)
+
+        assert received, "Wildcard shared subscription consumer never received the message"
+        assert received[0]['topic'] == 'integ/sensors/temp'
+        assert received[0]['payload'] == b'42C'
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 properties — requires live Docker broker
+# ---------------------------------------------------------------------------
+
+class TestMQTTv5PropertiesIntegration:
+    """End-to-end: MQTTv5 properties survive the broker and reach the consumer."""
+
+    async def test_correlation_data_received(self, live_broker):
+        """CorrelationData published by a v5 client is delivered to the consumer."""
+        received = []
+        ready = threading.Event()
+
+        class V5Consumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('integ/v5/props', qos=1)
+                ready.set()
+
+            async def receive(self, mqtt_message):
+                received.append(mqtt_message)
+
+            async def disconnect(self):
+                pass
+
+        server = Server(V5Consumer.as_asgi(), host='localhost', port=live_broker,
+                        protocol=mqtt.MQTTv5, client_id=None)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        loop = asyncio.get_event_loop()
+        connected = await loop.run_in_executor(None, lambda: ready.wait(timeout=5))
+        if not connected:
+            pytest.fail("Consumer did not connect within 5 seconds")
+
+        pub_client = _make_paho_v5_client()
+        pub_client.connect('localhost', live_broker)
+        pub_client.loop_start()
+
+        props = Properties(PacketTypes.PUBLISH)
+        props.CorrelationData = b'req-integ-001'
+        props.ContentType = 'application/json'
+        pub_client.publish('integ/v5/props', b'{"ok": true}', qos=1, properties=props)
+        time.sleep(0.5)
+        pub_client.loop_stop()
+        pub_client.disconnect()
+
+        deadline = time.time() + 3
+        while not received and time.time() < deadline:
+            await asyncio.sleep(0.05)
+
+        assert received, "Consumer never received the v5 message"
+        assert received[0]['properties'].get('CorrelationData') == b'req-integ-001'
+        assert received[0]['properties'].get('ContentType') == 'application/json'
+
+    async def test_request_reply_with_correlation_data(self, live_broker):
+        """Consumer echoes CorrelationData back to ResponseTopic — full request/reply flow."""
+        replies = []
+        server_ready = threading.Event()
+
+        class ReplyConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('integ/v5/requests', qos=1)
+                server_ready.set()
+
+            async def receive(self, mqtt_message):
+                props = mqtt_message.get('properties', {})
+                reply_topic = props.get('ResponseTopic')
+                correlation_id = props.get('CorrelationData')
+                if reply_topic:
+                    await self.publish(
+                        reply_topic,
+                        b'{"status": "ok"}',
+                        qos=1,
+                        properties={'CorrelationData': correlation_id},
+                    )
+
+            async def disconnect(self):
+                pass
+
+        server = Server(ReplyConsumer.as_asgi(), host='localhost', port=live_broker,
+                        protocol=mqtt.MQTTv5, client_id=None)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        loop = asyncio.get_event_loop()
+        connected = await loop.run_in_executor(None, lambda: server_ready.wait(timeout=5))
+        if not connected:
+            pytest.fail("Consumer did not connect within 5 seconds")
+
+        reply_received = threading.Event()
+
+        req_client = _make_paho_v5_client()
+
+        def on_message(client, userdata, msg):
+            replies.append(msg)
+            reply_received.set()
+
+        req_client.on_message = on_message
+        req_client.connect('localhost', live_broker)
+        req_client.loop_start()
+        req_client.subscribe('integ/v5/replies', qos=1)
+        time.sleep(0.2)
+
+        props = Properties(PacketTypes.PUBLISH)
+        props.CorrelationData = b'corr-456'
+        props.ResponseTopic = 'integ/v5/replies'
+        req_client.publish('integ/v5/requests', b'{"action": "ping"}', qos=1, properties=props)
+
+        await loop.run_in_executor(None, lambda: reply_received.wait(timeout=5))
+        req_client.loop_stop()
+        req_client.disconnect()
+
+        assert replies, "No reply received on ResponseTopic"
+        reply_props = replies[0].properties
+        assert reply_props.CorrelationData == b'corr-456'

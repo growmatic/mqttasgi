@@ -21,6 +21,19 @@ _PROPS_ATTRS = (
 )
 
 
+def _shared_sub_real_topic(topic: str) -> str:
+    """Strip the $share/<group>/ prefix from a shared subscription filter.
+
+    The broker delivers messages using the real topic (without the prefix),
+    so paho callbacks must be registered under the real topic.
+    '$share/group/a/b' -> 'a/b', 'a/b' -> 'a/b'
+    """
+    if topic.startswith('$share/'):
+        parts = topic.split('/', 2)
+        return parts[2] if len(parts) >= 3 else topic
+    return topic
+
+
 def _properties_to_dict(props) -> dict:
     """Convert a paho Properties object to a plain dict (only set attrs)."""
     if props is None:
@@ -244,7 +257,8 @@ class Server(object):
 
     async def mqtt_subscribe(self, app_id, msg):
         mqqt_subscritpion = msg['mqtt']
-        topic = mqqt_subscritpion['topic']
+        raw_topic = mqqt_subscritpion['topic']
+        topic = _shared_sub_real_topic(raw_topic)  # stripped; used as internal key
         qos = mqqt_subscritpion['qos']
         if topic not in self.topics_subscription:
             self.topics_subscription[topic] = {'qos': -1, 'apps': set()}
@@ -262,8 +276,8 @@ class Server(object):
         if qos_diff > 0 and len(status['apps']) > 0:
             self.log.debug(
                 "[mqttasgi][app][subscribe] - Subscription to {} must be updated to QOS: {}".format(topic, qos))
-            self.client.unsubscribe(topic)
-            self.client.subscribe(topic, qos)
+            self.client.unsubscribe(raw_topic)
+            self.client.subscribe(raw_topic, qos)
             status['qos'] = qos
         elif len(status['apps']) == 0:
             self.log.debug("[mqttasgi][app][subscribe] - Subscription to {}:{}".format(topic, qos))
@@ -271,7 +285,7 @@ class Server(object):
                                                            _sub=topic: self._mqtt_receive(
                                                                _sub, message.topic, message.payload, message.qos,
                                                                _properties_to_dict(getattr(message, 'properties', None))))
-            self.client.subscribe(topic, qos)
+            self.client.subscribe(raw_topic, qos)
             status['qos'] = qos
         else:
             self.log.debug(
@@ -303,7 +317,8 @@ class Server(object):
 
     async def mqtt_unsubscribe(self, app_id, msg, soft=False):
         mqqt_unsubscritpion = msg['mqtt']
-        topic = mqqt_unsubscritpion['topic']
+        raw_topic = mqqt_unsubscritpion['topic']
+        topic = _shared_sub_real_topic(raw_topic)  # stripped; internal key
         if topic not in self.topics_subscription:
             self.log.error("[mqttasgi][app][unsubscribe] - Tried to unsubscribe from non existing topic {}".format(topic))
             return
@@ -318,10 +333,9 @@ class Server(object):
         if topic in self.application_data[app_id]['subscriptions']:
             del self.application_data[app_id]['subscriptions'][topic]
 
-
         if len(status['apps']) == 1:
             if not soft:
-                self.client.unsubscribe(topic)
+                self.client.unsubscribe(raw_topic)
             self.client.message_callback_remove(topic)
             self.topics_subscription[topic] = {'qos': 0, 'apps': set()}
             self.log.debug("[mqttasgi][app][unsubscribe] - {} Unsubscribed from {}".format('Soft' if soft else '',

@@ -592,13 +592,25 @@ class TestSharedSubscriptions:
         registered = server.client.message_callback_add.call_args[0][0]
         assert registered == 'sensors/temp'
 
+    async def test_topics_subscription_keyed_by_real_topic(self):
+        """topics_subscription must be keyed by the real topic, not $share/…."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+        assert 'sensors/temp' in server.topics_subscription
+        assert '$share/mygroup/sensors/temp' not in server.topics_subscription
+
     async def test_message_delivered_to_subscribed_app(self):
-        """Message arriving on 'sensors/temp' must reach app subscribed via $share/…."""
+        """Message arriving on 'sensors/temp' must reach app subscribed via $share/….
+
+        The lambda registered in message_callback_add passes the stripped topic
+        as the subscription key to _mqtt_receive.
+        """
         server = self._make_server_with_app()
         await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
 
-        # Message delivered from the broker with the real (stripped) topic
-        server._mqtt_receive('$share/mygroup/sensors/temp', 'sensors/temp', b'25C', 1)
+        # After subscribe, internal key is the stripped topic.
+        # Simulate paho calling _mqtt_receive with the stripped subscription key.
+        server._mqtt_receive('sensors/temp', 'sensors/temp', b'25C', 1)
 
         event = server.application_data[0]['receive'].get_nowait()
         assert event['type'] == 'mqtt.msg'
