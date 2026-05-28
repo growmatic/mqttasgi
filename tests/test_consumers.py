@@ -191,3 +191,208 @@ class TestConsumerParameters:
         assert received['site'] == 'warehouse'
         assert received['app_id'] == 5
         await comm.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 — Consumer publish with properties
+# ---------------------------------------------------------------------------
+
+class TestMQTTv5ConsumerPublish:
+    """MqttConsumer.publish() must accept and forward an optional properties dict.
+
+    All tests in this class fail until consumers.py adds ``properties=None``
+    to ``MqttConsumer.publish()`` and includes it in the outgoing mqtt.pub event.
+    """
+
+    async def test_publish_with_properties_includes_them_in_event(self):
+        """publish(topic, payload, properties={...}) puts properties in the mqtt.pub event."""
+
+        class PubWithPropsConsumer(MqttConsumer):
+            async def connect(self):
+                await self.publish('out', b'data', qos=1,
+                                   properties={'CorrelationData': b'req-1'})
+
+            async def receive(self, mqtt_message):
+                pass
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(PubWithPropsConsumer.as_asgi(), app_id=1)
+        response = await comm.connect()
+        assert response['type'] == 'mqtt.pub'
+        assert response['mqtt']['properties'] == {'CorrelationData': b'req-1'}
+        await comm.disconnect()
+
+    async def test_publish_without_properties_emits_empty_dict(self):
+        """publish() with no properties must include properties: {} in the event.
+
+        Consumers and the server rely on the key always being present so they
+        can call msg['properties'] without guarding with .get().
+        """
+
+        class NoPropConsumer(MqttConsumer):
+            async def connect(self):
+                await self.publish('out', b'data', qos=1)
+
+            async def receive(self, mqtt_message):
+                pass
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(NoPropConsumer.as_asgi(), app_id=1)
+        response = await comm.connect()
+        assert response['type'] == 'mqtt.pub'
+        assert response['mqtt']['properties'] == {}
+        await comm.disconnect()
+
+    async def test_publish_response_topic_property(self):
+        """publish() forwards ResponseTopic property."""
+
+        class RespTopicConsumer(MqttConsumer):
+            async def connect(self):
+                await self.publish('out', b'data', qos=1,
+                                   properties={'ResponseTopic': 'reply/q'})
+
+            async def receive(self, mqtt_message):
+                pass
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(RespTopicConsumer.as_asgi(), app_id=1)
+        response = await comm.connect()
+        assert response['mqtt']['properties']['ResponseTopic'] == 'reply/q'
+        await comm.disconnect()
+
+    async def test_publish_user_property(self):
+        """publish() forwards UserProperty list."""
+
+        class UserPropConsumer(MqttConsumer):
+            async def connect(self):
+                await self.publish('out', b'data', qos=1,
+                                   properties={'UserProperty': [('env', 'prod')]})
+
+            async def receive(self, mqtt_message):
+                pass
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(UserPropConsumer.as_asgi(), app_id=1)
+        response = await comm.connect()
+        assert response['mqtt']['properties']['UserProperty'] == [('env', 'prod')]
+        await comm.disconnect()
+
+    async def test_publish_echoes_received_correlation_data(self):
+        """Consumer echoes CorrelationData from an incoming message back in a publish.
+
+        Tests the full round-trip: properties arrive in receive(), then go out
+        via publish(properties=...).
+        """
+
+        class EchoCorrelationConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('test/in', qos=1)
+
+            async def receive(self, mqtt_message):
+                await self.publish(
+                    'test/out',
+                    b'response',
+                    qos=1,
+                    properties={
+                        'CorrelationData': mqtt_message.get('properties', {}).get('CorrelationData', b''),
+                    },
+                )
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(EchoCorrelationConsumer.as_asgi(), app_id=1)
+        await comm.connect()  # subscribe response consumed
+
+        await comm.send_input({
+            'type': 'mqtt.msg',
+            'mqtt': {
+                'topic': 'test/in',
+                'payload': b'ping',
+                'qos': 1,
+                'properties': {'CorrelationData': b'echo-id'},
+            }
+        })
+
+        response = await comm.receive_from()
+        assert response['type'] == 'mqtt.pub'
+        assert response['mqtt']['properties']['CorrelationData'] == b'echo-id'
+        await comm.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 — Consumer receive exposes properties from server event
+# ---------------------------------------------------------------------------
+
+class TestMQTTv5ConsumerReceive:
+    """mqtt_msg event with properties must pass them through to receive().
+
+    These tests are regression guards: the current dict-passthrough in
+    mqtt_msg() already handles this, but they ensure no future refactor
+    accidentally drops the properties key.
+    """
+
+    async def test_receive_passes_properties_to_handler(self):
+        """mqtt_message dict in receive() includes properties when the event has them."""
+        received = {}
+
+        class CapturePropsConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('t', qos=1)
+
+            async def receive(self, mqtt_message):
+                received.update(mqtt_message)
+                await self.publish('done', b'ok', qos=0)
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(CapturePropsConsumer.as_asgi(), app_id=1)
+        await comm.connect()  # subscribe response consumed
+
+        await comm.send_input({
+            'type': 'mqtt.msg',
+            'mqtt': {
+                'topic': 't',
+                'payload': b'hi',
+                'qos': 0,
+                'properties': {'ContentType': 'application/json'},
+            }
+        })
+        await comm.receive_from()  # wait for echo sentinel
+
+        assert received.get('properties') == {'ContentType': 'application/json'}
+        await comm.disconnect()
+
+    async def test_receive_event_without_properties_key_does_not_crash(self):
+        """receive() is not broken by events that have no 'properties' key (v3.1.1 compat)."""
+
+        class RobustConsumer(MqttConsumer):
+            async def connect(self):
+                await self.subscribe('t', qos=1)
+
+            async def receive(self, mqtt_message):
+                _ = mqtt_message.get('properties', {})  # safe access
+                await self.publish('done', b'ok', qos=0)
+
+            async def disconnect(self):
+                pass
+
+        comm = MqttComunicator(RobustConsumer.as_asgi(), app_id=1)
+        await comm.connect()  # subscribe response consumed
+
+        await comm.send_input({
+            'type': 'mqtt.msg',
+            'mqtt': {'topic': 't', 'payload': b'no-props', 'qos': 0},
+        })
+        await comm.receive_from()  # no crash is the primary assertion
+
+        await comm.disconnect()

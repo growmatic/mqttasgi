@@ -6,15 +6,30 @@ These tests do NOT require a running MQTT broker. They verify:
 - Callback signatures accept both paho API versions
 - Server initialises without errors
 - MQTTv5 protocol selection and clean_start handling
+- MQTTv5 properties: helper, receive, publish, callbacks
 """
 
 import asyncio
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch, call
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.properties import Properties
+from paho.mqtt.packettypes import PacketTypes
 
 from mqttasgi.server import Server, _PAHO_MQTT_V2
+
+# _properties_to_dict is added by the MQTTv5 properties commit.
+# Tests that depend on it are skipped until it is importable.
+try:
+    from mqttasgi.server import _properties_to_dict
+    _PROPS_AVAILABLE = True
+except ImportError:
+    _properties_to_dict = None
+    _PROPS_AVAILABLE = False
+
+_needs_props = pytest.mark.skipif(not _PROPS_AVAILABLE,
+                                   reason="_properties_to_dict not yet in server.py")
 
 
 # ---------------------------------------------------------------------------
@@ -272,3 +287,241 @@ class TestMQTTv5Reconnect:
 
             server.client.reconnect.assert_called_once()
             server.client.connect.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 properties — _properties_to_dict helper
+# ---------------------------------------------------------------------------
+
+@_needs_props
+class TestPropertiesHelper:
+    """_properties_to_dict converts a paho Properties object to a plain dict.
+
+    Only non-None attributes are included so that consumers can safely call
+    .get('CorrelationData') without always checking for key presence.
+    """
+
+    def _make_props(self, **kwargs):
+        """Create a real paho Properties object for PUBLISH packets."""
+        props = Properties(PacketTypes.PUBLISH)
+        for key, value in kwargs.items():
+            setattr(props, key, value)
+        return props
+
+    def test_none_returns_empty_dict(self):
+        assert _properties_to_dict(None) == {}
+
+    def test_empty_props_returns_empty_dict(self):
+        """A Properties object with no attributes set returns {}."""
+        props = Properties(PacketTypes.PUBLISH)
+        assert _properties_to_dict(props) == {}
+
+    def test_extracts_correlation_data(self):
+        props = self._make_props(CorrelationData=b'req-123')
+        result = _properties_to_dict(props)
+        assert result['CorrelationData'] == b'req-123'
+
+    def test_extracts_response_topic(self):
+        props = self._make_props(ResponseTopic='reply/queue')
+        result = _properties_to_dict(props)
+        assert result['ResponseTopic'] == 'reply/queue'
+
+    def test_extracts_content_type(self):
+        props = self._make_props(ContentType='application/json')
+        result = _properties_to_dict(props)
+        assert result['ContentType'] == 'application/json'
+
+    def test_extracts_user_property(self):
+        props = self._make_props(UserProperty=[('key', 'value')])
+        result = _properties_to_dict(props)
+        assert result['UserProperty'] == [('key', 'value')]
+
+    def test_extracts_message_expiry_interval(self):
+        props = self._make_props(MessageExpiryInterval=60)
+        result = _properties_to_dict(props)
+        assert result['MessageExpiryInterval'] == 60
+
+    def test_extracts_payload_format_indicator(self):
+        props = self._make_props(PayloadFormatIndicator=1)
+        result = _properties_to_dict(props)
+        assert result['PayloadFormatIndicator'] == 1
+
+    def test_only_set_attrs_are_included(self):
+        """A Properties object with only CorrelationData must not contain other keys."""
+        props = self._make_props(CorrelationData=b'x')
+        result = _properties_to_dict(props)
+        assert set(result.keys()) == {'CorrelationData'}
+
+    def test_multiple_attrs_all_extracted(self):
+        props = self._make_props(
+            CorrelationData=b'id-1',
+            ResponseTopic='resp/topic',
+        )
+        result = _properties_to_dict(props)
+        assert result == {'CorrelationData': b'id-1', 'ResponseTopic': 'resp/topic'}
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 properties — _mqtt_receive propagates to consumers and queues
+# ---------------------------------------------------------------------------
+
+class TestMQTTv5Receive:
+    """_mqtt_receive must include a 'properties' key in every mqtt.msg event."""
+
+    def _make_subscribed_server(self):
+        """Return a server with one app registered on 'test/topic'."""
+        server = _make_server()
+        server.application_data[0] = {'receive': asyncio.Queue(), 'subscriptions': {}}
+        server.topics_subscription['test/topic'] = {'qos': 1, 'apps': {0}}
+        return server
+
+    def test_properties_included_in_mqtt_msg_event(self):
+        """Delivered message event must contain the properties dict."""
+        server = self._make_subscribed_server()
+        server._mqtt_receive('test/topic', 'test/topic', b'hello', 1,
+                              {'CorrelationData': b'abc'})
+        event = server.application_data[0]['receive'].get_nowait()
+        assert event['mqtt']['properties'] == {'CorrelationData': b'abc'}
+
+    def test_properties_default_to_empty_dict(self):
+        """When no properties are passed, the event must still have properties: {}."""
+        server = self._make_subscribed_server()
+        server._mqtt_receive('test/topic', 'test/topic', b'hello', 1)
+        event = server.application_data[0]['receive'].get_nowait()
+        assert event['mqtt']['properties'] == {}
+
+    def test_queued_message_stores_properties(self):
+        """Messages arriving before any subscription (sub=-1) must also store properties."""
+        server = _make_server()
+        server._mqtt_receive(-1, 'unknown/topic', b'data', 0,
+                              {'ResponseTopic': 'reply/here'})
+        queued = server.topic_queues['unknown/topic'][0]
+        assert queued['properties'] == {'ResponseTopic': 'reply/here'}
+
+    def test_queued_message_empty_properties(self):
+        """Queue path with no properties stores properties: {}."""
+        server = _make_server()
+        server._mqtt_receive(-1, 'unknown/topic', b'data', 0)
+        queued = server.topic_queues['unknown/topic'][0]
+        assert queued['properties'] == {}
+
+    def test_on_message_callback_extracts_paho_properties(self):
+        """The on_message lambda registered in __init__ must extract paho properties.
+
+        Simulates paho delivering a message with a real Properties object
+        and verifies that _mqtt_receive receives the extracted dict.
+        """
+        server = _make_server()
+        captured = {}
+
+        def fake_receive(subscription, topic, payload, qos, properties=None):
+            captured['properties'] = properties
+
+        server._mqtt_receive = fake_receive
+
+        # Simulate a paho v5 message with properties
+        fake_msg = MagicMock()
+        fake_msg.topic = 'some/topic'
+        fake_msg.payload = b'payload'
+        fake_msg.qos = 1
+        props = Properties(PacketTypes.PUBLISH)
+        props.CorrelationData = b'req-42'
+        fake_msg.properties = props
+
+        server.client.on_message(None, None, fake_msg)
+
+        assert captured.get('properties', 'NOT_PASSED') != 'NOT_PASSED', \
+            "on_message did not pass properties to _mqtt_receive"
+        assert captured['properties'].get('CorrelationData') == b'req-42'
+
+    def test_on_message_callback_no_properties_passes_empty_dict(self):
+        """on_message with a v3.1.1 message (no properties attr) must pass {}."""
+        server = _make_server()
+        captured = {}
+
+        def fake_receive(subscription, topic, payload, qos, properties=None):
+            captured['properties'] = properties
+
+        server._mqtt_receive = fake_receive
+
+        fake_msg = MagicMock(spec=['topic', 'payload', 'qos'])  # no .properties attr
+        fake_msg.topic = 'some/topic'
+        fake_msg.payload = b'payload'
+        fake_msg.qos = 0
+
+        server.client.on_message(None, None, fake_msg)
+
+        assert captured['properties'] == {}
+
+
+# ---------------------------------------------------------------------------
+# MQTTv5 properties — mqtt_publish builds paho Properties object
+# ---------------------------------------------------------------------------
+
+class TestMQTTv5Publish:
+    """mqtt_publish must build a paho Properties object for v5 and omit it for v3.1.1."""
+
+    def _make_v5_server(self):
+        server = Server(AsyncMock(), 'localhost', 1883, protocol=mqtt.MQTTv5)
+        server.client.publish = MagicMock()
+        return server
+
+    def _make_v311_server(self):
+        server = _make_server()
+        server.client.publish = MagicMock()
+        return server
+
+    def _pub_msg(self, **props):
+        return {
+            'type': 'mqtt.pub',
+            'mqtt': {'topic': 't', 'payload': b'p', 'qos': 1, 'retain': False,
+                     'properties': props},
+        }
+
+    async def test_v5_correlation_data_bytes_passed_through(self):
+        server = self._make_v5_server()
+        await server.mqtt_publish(0, self._pub_msg(CorrelationData=b'req-1'))
+        _, kwargs = server.client.publish.call_args
+        assert kwargs['properties'].CorrelationData == b'req-1'
+
+    async def test_v5_correlation_data_str_encoded_to_bytes(self):
+        """CorrelationData as str must be encoded to bytes before setting on Properties."""
+        server = self._make_v5_server()
+        await server.mqtt_publish(0, self._pub_msg(CorrelationData='req-1'))
+        _, kwargs = server.client.publish.call_args
+        assert kwargs['properties'].CorrelationData == b'req-1'
+
+    async def test_v5_response_topic(self):
+        server = self._make_v5_server()
+        await server.mqtt_publish(0, self._pub_msg(ResponseTopic='reply/q'))
+        _, kwargs = server.client.publish.call_args
+        assert kwargs['properties'].ResponseTopic == 'reply/q'
+
+    async def test_v5_content_type(self):
+        server = self._make_v5_server()
+        await server.mqtt_publish(0, self._pub_msg(ContentType='application/json'))
+        _, kwargs = server.client.publish.call_args
+        assert kwargs['properties'].ContentType == 'application/json'
+
+    async def test_v5_user_property(self):
+        server = self._make_v5_server()
+        await server.mqtt_publish(0, self._pub_msg(UserProperty=[('k', 'v')]))
+        _, kwargs = server.client.publish.call_args
+        assert kwargs['properties'].UserProperty == [('k', 'v')]
+
+    async def test_v5_no_properties_publish_still_passes_properties_kwarg(self):
+        """v5 publish with empty properties dict must still pass a Properties object."""
+        server = self._make_v5_server()
+        msg = {'type': 'mqtt.pub',
+               'mqtt': {'topic': 't', 'payload': b'p', 'qos': 1, 'retain': False}}
+        await server.mqtt_publish(0, msg)
+        _, kwargs = server.client.publish.call_args
+        assert 'properties' in kwargs
+        assert isinstance(kwargs['properties'], Properties)
+
+    async def test_v311_publish_never_passes_properties_kwarg(self):
+        """v3.1.1 publish must NOT include a properties kwarg — paho would reject it."""
+        server = self._make_v311_server()
+        await server.mqtt_publish(0, self._pub_msg(CorrelationData=b'x'))
+        _, kwargs = server.client.publish.call_args
+        assert 'properties' not in kwargs
