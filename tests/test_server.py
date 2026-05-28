@@ -547,3 +547,99 @@ class TestMQTTv5Publish:
         with patch.object(server.log, 'warning') as mock_warn:
             await server.mqtt_publish(0, msg)
         mock_warn.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Shared subscriptions — $share/<group>/<topic>
+# ---------------------------------------------------------------------------
+
+class TestSharedSubscriptions:
+    """Shared subscription filters ($share/<group>/<topic>) must be handled correctly.
+
+    The broker strips the $share/<group>/ prefix before delivering messages,
+    so the topic in incoming messages is the real topic (e.g. 'sensors/temp'),
+    not the full filter ('$share/mygroup/sensors/temp').
+
+    paho's message_callback_add routes by matching message.topic against the
+    registered filter.  mqtt.topic_matches_sub('$share/g/t', 't') returns False,
+    so callbacks registered with the full $share string are never fired.
+
+    The fix: register message_callback_add with the real (stripped) topic while
+    still passing the full $share string to client.subscribe / client.unsubscribe.
+    """
+
+    def _make_server_with_app(self):
+        server = _make_server()
+        server.application_data[0] = {'receive': asyncio.Queue(), 'subscriptions': {}}
+        server.client.subscribe = MagicMock()
+        server.client.unsubscribe = MagicMock()
+        server.client.message_callback_add = MagicMock()
+        server.client.message_callback_remove = MagicMock()
+        return server
+
+    # --- subscribe ---
+
+    async def test_paho_subscribe_uses_full_shared_topic(self):
+        """client.subscribe must receive the full $share/<group>/<topic> string."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+        server.client.subscribe.assert_called_once_with('$share/mygroup/sensors/temp', 1)
+
+    async def test_message_callback_uses_real_topic(self):
+        """message_callback_add must be registered for the real topic, not $share/…."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+        registered = server.client.message_callback_add.call_args[0][0]
+        assert registered == 'sensors/temp'
+
+    async def test_message_delivered_to_subscribed_app(self):
+        """Message arriving on 'sensors/temp' must reach app subscribed via $share/…."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+
+        # Message delivered from the broker with the real (stripped) topic
+        server._mqtt_receive('$share/mygroup/sensors/temp', 'sensors/temp', b'25C', 1)
+
+        event = server.application_data[0]['receive'].get_nowait()
+        assert event['type'] == 'mqtt.msg'
+        assert event['mqtt']['topic'] == 'sensors/temp'
+        assert event['mqtt']['payload'] == b'25C'
+
+    async def test_shared_sub_multi_level_wildcard_real_topic(self):
+        """$share filter with a wildcard real topic is registered correctly."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/grp/sensors/#', 'qos': 1}})
+        registered = server.client.message_callback_add.call_args[0][0]
+        assert registered == 'sensors/#'
+
+    # --- unsubscribe ---
+
+    async def test_paho_unsubscribe_uses_full_shared_topic(self):
+        """client.unsubscribe must receive the full $share/<group>/<topic> string."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+        await server.mqtt_unsubscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp'}})
+        server.client.unsubscribe.assert_called_once_with('$share/mygroup/sensors/temp')
+
+    async def test_unsubscribe_removes_real_topic_callback(self):
+        """message_callback_remove must use the real topic, not $share/…."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp', 'qos': 1}})
+        await server.mqtt_unsubscribe(0, {'mqtt': {'topic': '$share/mygroup/sensors/temp'}})
+        server.client.message_callback_remove.assert_called_once_with('sensors/temp')
+
+    # --- regular topics unaffected ---
+
+    async def test_regular_topic_message_callback_unchanged(self):
+        """Non-shared subscriptions must still register with the topic as-is."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': 'sensors/temp', 'qos': 1}})
+        registered = server.client.message_callback_add.call_args[0][0]
+        assert registered == 'sensors/temp'
+
+    async def test_regular_topic_unsubscribe_callback_unchanged(self):
+        """Non-shared unsubscribe must still remove the topic as-is."""
+        server = self._make_server_with_app()
+        await server.mqtt_subscribe(0, {'mqtt': {'topic': 'sensors/temp', 'qos': 1}})
+        await server.mqtt_unsubscribe(0, {'mqtt': {'topic': 'sensors/temp'}})
+        server.client.message_callback_remove.assert_called_once_with('sensors/temp')
