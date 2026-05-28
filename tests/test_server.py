@@ -525,3 +525,25 @@ class TestMQTTv5Publish:
         await server.mqtt_publish(0, self._pub_msg(CorrelationData=b'x'))
         _, kwargs = server.client.publish.call_args
         assert 'properties' not in kwargs
+
+    async def test_v311_publish_with_properties_logs_warning(self):
+        """v3.1.1 publish with a non-empty properties dict must emit a warning.
+
+        Properties are silently dropped on v3.1.1, so callers must be told
+        via a log warning rather than failing silently.
+        """
+        server = self._make_v311_server()
+        with patch.object(server.log, 'warning') as mock_warn:
+            await server.mqtt_publish(0, self._pub_msg(CorrelationData=b'x'))
+        mock_warn.assert_called_once()
+        warning_text = mock_warn.call_args[0][0]
+        assert 'properties' in warning_text and 'v3.1.1' in warning_text
+
+    async def test_v311_publish_without_properties_no_warning(self):
+        """v3.1.1 publish with no properties must not produce a warning."""
+        server = self._make_v311_server()
+        msg = {'type': 'mqtt.pub',
+               'mqtt': {'topic': 't', 'payload': b'p', 'qos': 1, 'retain': False}}
+        with patch.object(server.log, 'warning') as mock_warn:
+            await server.mqtt_publish(0, msg)
+        mock_warn.assert_not_called()

@@ -12,6 +12,7 @@ mqttasgi is an ASGI protocol server that implements a complete interface for MQT
 - Full Channel Layers support.
 - Full testing support to enable TDD (no broker required for unit tests).
 - Lightweight.
+- **MQTTv5 support** — protocol selection, `clean_start`, and full Properties (CorrelationData, ResponseTopic, ContentType, UserProperty, MessageExpiryInterval, PayloadFormatIndicator)
 - Django 3.2+ / Django 4.x / Django 5.x support
 - Channels 3.x / Channels 4.x support
 - paho-mqtt 1.x and 2.x support
@@ -48,6 +49,7 @@ mqttasgi -H localhost -p 1883 my_application.asgi:application
 | -SSL / --use-ssl | Use SSL (no certificate auth) | MQTT_USE_SSL | False |
 | -T / --transport | Transport type (tcp or websockets) | MQTT_TRANSPORT | tcp |
 | -r / --retries | Retries on disconnect (0 = unlimited) | MQTT_RETRIES | 3 |
+| -prot / --protocol | MQTT protocol version (`311` or `5`) | MQTT_PROTOCOL | 311 |
 | Last argument | ASGI Application | | |
 
 Environment variables are supported via a `.env` file at the project root. A CLI argument always takes precedence over the corresponding environment variable.
@@ -98,8 +100,19 @@ class MyMqttConsumer(MqttConsumer):
 #### Publish
 
 ```python
-await self.publish(topic, payload, qos=1, retain=False)
+await self.publish(topic, payload, qos=1, retain=False, properties=None)
 ```
+
+`properties` is an optional dict of MQTTv5 properties (ignored with a warning when running v3.1.1):
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `CorrelationData` | `bytes` or `str` | Correlates a request with its response |
+| `ResponseTopic` | `str` | Topic the receiver should publish its response to |
+| `ContentType` | `str` | MIME type of the payload (e.g. `application/json`) |
+| `UserProperty` | `list[tuple[str, str]]` | Arbitrary key/value pairs |
+| `MessageExpiryInterval` | `int` | Seconds until the broker discards the message |
+| `PayloadFormatIndicator` | `int` | `0` = binary, `1` = UTF-8 text |
 
 #### Subscribe
 
@@ -130,6 +143,49 @@ await self.spawn_worker(app_id, consumer_path, consumer_params)
 ```python
 await self.kill_worker(app_id)
 ```
+
+## MQTTv5
+
+Start the server with `-prot 5` to enable MQTTv5:
+
+```bash
+mqttasgi -H localhost -p 1883 -prot 5 my_application.asgi:application
+```
+
+### Receiving MQTTv5 properties
+
+When the broker delivers a message with properties, they are available in `mqtt_message['properties']` as a plain dict. The key is always present (empty dict for v3.1.1 or messages with no properties):
+
+```python
+class MyConsumer(MqttConsumer):
+    async def connect(self):
+        await self.subscribe('requests/#', qos=1)
+
+    async def receive(self, mqtt_message):
+        props = mqtt_message['properties']          # always a dict
+        correlation_id = props.get('CorrelationData')
+        reply_topic    = props.get('ResponseTopic')
+        content_type   = props.get('ContentType')
+
+        if reply_topic and correlation_id:
+            await self.publish(
+                reply_topic,
+                b'{"status": "ok"}',
+                qos=1,
+                properties={
+                    'CorrelationData': correlation_id,
+                    'ContentType': 'application/json',
+                },
+            )
+
+    async def disconnect(self):
+        await self.unsubscribe('requests/#')
+```
+
+### Notes
+
+- **v3.1.1 fallback**: if you pass `properties` to `publish()` while the server is configured for v3.1.1, the properties are dropped and a `WARNING` is logged. No exception is raised so the same consumer code can work across both protocol versions.
+- **`CorrelationData`** may be passed as `str` — it will be automatically encoded to `bytes`.
 
 ## Channel Layers
 

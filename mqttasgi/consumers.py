@@ -26,7 +26,7 @@ class MqttConsumer(AsyncConsumer):
     async def disconnect(self):
         pass
 
-    async def publish(self, topic, payload, qos=1, retain=False):
+    async def publish(self, topic, payload, qos=1, retain=False, properties=None):
         await self.send({
             'type': 'mqtt.pub',
             'mqtt': {
@@ -34,6 +34,7 @@ class MqttConsumer(AsyncConsumer):
                 'payload': payload,
                 'qos': qos,
                 'retain': retain,
+                'properties': properties or {},
             }
         })
 
