@@ -18,7 +18,7 @@ class Server(object):
     def __init__(self, application, host, port, username=None, password=None,
                  client_id=2407, mqtt_type_pub=None, mqtt_type_usub=None, mqtt_type_sub=None,
                  mqtt_type_msg=None, connect_max_retries=3, logger=None, clean_session=True, cert=None, key=None, ca_cert=None,
-                 use_ssl=False, transport ="tcp"):
+                 use_ssl=False, transport ="tcp", exit_on_reconnect_failure=False):
 
         self.application_type = application
         self.application_data = {}
@@ -59,6 +59,7 @@ class Server(object):
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.connect_max_retries = connect_max_retries
+        self.exit_on_reconnect_failure = exit_on_reconnect_failure
         self.client.on_message = lambda client, userdata, message: \
             self._mqtt_receive(-1, message.topic, message.payload, message.qos)
 
@@ -121,6 +122,13 @@ class Server(object):
                 'type': 'mqtt.disconnect',
                 'mqtt': {}
             })
+        if self.exit_on_reconnect_failure:
+            self.log.error(
+                "[mqttasgi][connection][reconnect] - Failed to reconnect after {}"
+                " attempts, exiting with code 1".format(self.connect_max_retries)
+            )
+            import sys
+            sys.exit(1)
         raise Exception("[mqttasgi][connection][reconnect] - Failed to reconnect after {} attempts".format(self.connect_max_retries))
 
     def _mqtt_receive(self, subscription, topic, payload, qos):

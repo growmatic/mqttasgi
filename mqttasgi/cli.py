@@ -46,6 +46,10 @@ def main():
                         default=os.environ.get("MQTT_TRANSPORT", "tcp"))
     parser.add_argument("-r", "--retries", help="Maximum number of connection retries after unexpected disconnect (0 to always try to reconnect)",
                         default=os.environ.get("MQTT_RETRIES", 3), type=int)
+    parser.add_argument("--exit-on-reconnect-failure", dest="exit_on_reconnect_failure",
+                        help="Exit the process with code 1 when reconnect retries are exhausted, instead of raising (useful for container restart policies)",
+                        type=bool_type_converter,
+                        default=bool_type_converter(os.environ.get("MQTT_EXIT_ON_RECONNECT_FAILURE", "False")))
 
     parser.add_argument("application",
                         help=("The ASGI application instance to use as "
@@ -77,7 +81,8 @@ def main():
         ca_cert=args.cacert,
         connect_max_retries=args.retries,
         use_ssl=args.use_ssl,
-        transport = args.transport
+        transport = args.transport,
+        exit_on_reconnect_failure=args.exit_on_reconnect_failure,
     )
 
     server.run()
