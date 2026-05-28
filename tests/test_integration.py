@@ -270,7 +270,8 @@ class TestSharedSubIntegration:
             async def disconnect(self):
                 pass
 
-        server = Server(SharedSubConsumer.as_asgi(), host='localhost', port=live_broker, client_id=None)
+        server = Server(SharedSubConsumer.as_asgi(), host='localhost', port=live_broker,
+                        protocol=mqtt.MQTTv5, client_id=None)
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
@@ -311,7 +312,8 @@ class TestSharedSubIntegration:
             async def disconnect(self):
                 pass
 
-        server = Server(WildcardSharedConsumer.as_asgi(), host='localhost', port=live_broker, client_id=None)
+        server = Server(WildcardSharedConsumer.as_asgi(), host='localhost', port=live_broker,
+                        protocol=mqtt.MQTTv5, client_id=None)
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 

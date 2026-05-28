@@ -182,6 +182,25 @@ class MyConsumer(MqttConsumer):
         await self.unsubscribe('requests/#')
 ```
 
+### Shared subscriptions
+
+Shared subscriptions let multiple consumers load-balance messages from the same topic. Use the `$share/<group>/<topic>` filter in `subscribe()`:
+
+```python
+class WorkerConsumer(MqttConsumer):
+    async def connect(self):
+        # All instances subscribed to the same group share the message load
+        await self.subscribe('$share/workers/jobs/#', qos=1)
+
+    async def receive(self, mqtt_message):
+        print('Processing job on topic:', mqtt_message['topic'])
+
+    async def disconnect(self):
+        await self.unsubscribe('$share/workers/jobs/#')
+```
+
+Shared subscriptions require MQTTv5 — start the server with `-prot 5`. Attempting a `$share/…` subscription with v3.1.1 logs an error and is ignored.
+
 ### Notes
 
 - **v3.1.1 fallback**: if you pass `properties` to `publish()` while the server is configured for v3.1.1, the properties are dropped and a `WARNING` is logged. No exception is raised so the same consumer code can work across both protocol versions.

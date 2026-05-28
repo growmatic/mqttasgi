@@ -258,6 +258,14 @@ class Server(object):
     async def mqtt_subscribe(self, app_id, msg):
         mqqt_subscritpion = msg['mqtt']
         raw_topic = mqqt_subscritpion['topic']
+        if raw_topic.startswith('$share/') and self.protocol != mqtt.MQTTv5:
+            self.log.error(
+                "[mqttasgi][app][subscribe] - Shared subscriptions ($share/…) require MQTTv5; "
+                "app_id=%s tried to subscribe to '%s' but protocol is v3.1.1. "
+                "Start the server with -prot 5.",
+                app_id, raw_topic,
+            )
+            return
         topic = _shared_sub_real_topic(raw_topic)  # stripped; used as internal key
         qos = mqqt_subscritpion['qos']
         if topic not in self.topics_subscription:

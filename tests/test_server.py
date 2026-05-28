@@ -568,14 +568,33 @@ class TestSharedSubscriptions:
     still passing the full $share string to client.subscribe / client.unsubscribe.
     """
 
-    def _make_server_with_app(self):
-        server = _make_server()
+    def _make_server_with_app(self, protocol=mqtt.MQTTv5):
+        server = Server(AsyncMock(), 'localhost', 1883, protocol=protocol)
         server.application_data[0] = {'receive': asyncio.Queue(), 'subscriptions': {}}
         server.client.subscribe = MagicMock()
         server.client.unsubscribe = MagicMock()
         server.client.message_callback_add = MagicMock()
         server.client.message_callback_remove = MagicMock()
         return server
+
+    # --- protocol guard ---
+
+    async def test_shared_sub_rejected_on_v311(self):
+        """$share/… subscribe must be rejected with an error log when protocol is v3.1.1."""
+        server = self._make_server_with_app(protocol=mqtt.MQTTv311)
+        with patch.object(server.log, 'error') as mock_error:
+            await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/g/t', 'qos': 1}})
+        mock_error.assert_called_once()
+        assert '$share' in mock_error.call_args[0][0]
+        server.client.subscribe.assert_not_called()
+
+    async def test_shared_sub_allowed_on_v5(self):
+        """$share/… subscribe must proceed normally when protocol is MQTTv5."""
+        server = self._make_server_with_app(protocol=mqtt.MQTTv5)
+        with patch.object(server.log, 'error') as mock_error:
+            await server.mqtt_subscribe(0, {'mqtt': {'topic': '$share/g/sensors/temp', 'qos': 1}})
+        mock_error.assert_not_called()
+        server.client.subscribe.assert_called_once_with('$share/g/sensors/temp', 1)
 
     # --- subscribe ---
 
